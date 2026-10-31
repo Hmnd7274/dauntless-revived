@@ -396,8 +396,14 @@ void GameEngineTickHook(UGameEngine* GameEngine, float DeltaTime, char CanRender
 
                 if (TotalNoPlayersTime >= 50.0f) {
                     std::cout << "[IDLE-WATCHDOG] port=" << Globals::Port
-                              << " timeout reached, exiting" << std::endl;
-                    exit(0);
+                              << " timeout reached, terminating process" << std::endl;
+
+                    if (!TerminateProcess(GetCurrentProcess(), 0)) {
+                        const DWORD TerminateError = GetLastError();
+                        std::cerr << "[IDLE-WATCHDOG] TerminateProcess failed, error="
+                                  << TerminateError << "; falling back to ExitProcess" << std::endl;
+                        ExitProcess(0);
+                    }
                 }
             }
 
