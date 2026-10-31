@@ -977,16 +977,23 @@ void Init() {
         }
 
         if (Globals::EnableLogging) {
-            AllocConsole();
-            FILE* Dummy;
-            freopen_s(&Dummy, "CONOUT$", "w", stdout);
-            freopen_s(&Dummy, "CONIN$", "r", stdin);
+            // Under Wine, use the inherited stdout/stderr.
+            // Creating a Windows console can interfere with Xvfb.
+            if (!IsRunningUnderWine()) {
+                AllocConsole();
+                FILE* Dummy;
+                freopen_s(&Dummy, "CONOUT$", "w", stdout);
+                freopen_s(&Dummy, "CONIN$", "r", stdin);
+            }
 
             std::cout << "Welcome to Undaunted v" << UNDAUNTED_INTERNAL_VERSION << "!" << std::endl;
             std::cout << "prod. gwog :3" << std::endl;
             std::cout << "thanks to all who contributed in any way, you know who you are, dm me on discord if you want a named shoutout here :3" << std::endl;
 
             std::cout << "Running as a server!" << std::endl;
+            std::cout << "[SERVER] port=" << Globals::Port
+                      << " wine=" << (IsRunningUnderWine() ? "yes" : "no")
+                      << std::endl;
         }
 
         InitServerHooks();
