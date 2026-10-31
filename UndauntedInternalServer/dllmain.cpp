@@ -366,12 +366,25 @@ void GameEngineTickHook(UGameEngine* GameEngine, float DeltaTime, char CanRender
 
     if (Globals::Listening && Networking::NetDriver) {
         bool HasConnection = false;
+        unsigned int ConnectionCount = 0;
+        unsigned int OpenConnectionCount = 0;
+        unsigned int ActiveConnectionCount = 0;
 
         for (UNetConnection* Connection : Networking::NetDriver->ClientConnections) {
-            if (!Connection->OwningActor || *(uint32_t*)((uintptr_t)Connection + 0x134) != 3)
+            if (!Connection)
+                continue;
+
+            ++ConnectionCount;
+            const uint32_t ConnectionState = *(uint32_t*)((uintptr_t)Connection + 0x134);
+
+            if (ConnectionState == 3)
+                ++OpenConnectionCount;
+
+            if (!Connection->OwningActor || ConnectionState != 3)
                 continue;
 
             HasConnection = true;
+            ++ActiveConnectionCount;
         }
 
         if (EnableWatchdog) {
@@ -382,12 +395,32 @@ void GameEngineTickHook(UGameEngine* GameEngine, float DeltaTime, char CanRender
                 TotalNoPlayersTime += DeltaTime;
 
                 if (TotalNoPlayersTime >= 50.0f) {
+                    std::cout << "[IDLE-WATCHDOG] port=" << Globals::Port
+                              << " timeout reached, exiting" << std::endl;
                     exit(0);
                 }
+            }
+
+            static float WatchdogLogElapsed = 0.0f;
+            WatchdogLogElapsed += DeltaTime;
+
+            if (WatchdogLogElapsed >= 10.0f) {
+                WatchdogLogElapsed = 0.0f;
+
+                std::cout << "[IDLE-WATCHDOG] port=" << Globals::Port
+                          << " connections=" << ConnectionCount
+                          << " open=" << OpenConnectionCount
+                          << " active=" << ActiveConnectionCount
+                          << " hasConnection=" << (HasConnection ? "yes" : "no")
+                          << " idleSeconds=" << TotalNoPlayersTime
+                          << std::endl;
             }
         }
 
         for (UNetConnection* Conn : Networking::NetDriver->ClientConnections) {
+            if (!Conn)
+                continue;
+
             if (Conn->PlayerController && Conn->PlayerController->Pawn) {
                 ((ABP_PlayerCharacter_C*)Conn->PlayerController->Pawn)->TickStamina(ECityExecFilter::Both, ERemoteExecFilter::All); // TODO: Risky cast, but IsA brutalizes our speed
             }
