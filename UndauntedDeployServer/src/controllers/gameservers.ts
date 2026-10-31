@@ -260,7 +260,8 @@ async function StartServerNow(Map: string, Behemoth: string | undefined, Matchma
         ], {
             // Keep the long-running Ramsgate and Dojo diagnostic windows visible,
             // but do not flash a new command window for every temporary hunt.
-            windowsHide: IsHunt
+            windowsHide: IsHunt,
+            stdio: "inherit"
         });
     }
     catch(error){

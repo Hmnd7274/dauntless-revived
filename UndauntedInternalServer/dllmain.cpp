@@ -965,6 +965,8 @@ void Init() {
             Globals::ExpectedPlayerString = Args[6];
             Globals::MyIpAndPort = Args[7];
 
+            Globals::EnableLogging = true; // TEMP: diagnostics for hunt servers
+
             if (Globals::Port >= 8776) {
                 EnableWatchdog = false;
                 Globals::EnableLogging = true;
