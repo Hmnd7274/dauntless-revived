@@ -325,7 +325,7 @@ void EncounterableSetupHook() {
 
 float TotalNoPlayersTime = 0.0f;
 
-bool EnableWatchdog = true;
+bool EnableWatchdog = false;
 
 // Read-only counters for diagnostics; the net driver's internal tag is not a frame counter.
 extern "C" {
