@@ -1,4 +1,4 @@
-import { accessSync, constants as fsConstants, existsSync, mkdirSync, readdirSync } from "node:fs";
+import { accessSync, constants as fsConstants, existsSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
@@ -90,7 +90,7 @@ export function buildWineLaunch(args, env = process.env) {
   let launchEnv;
   let runtime;
   if (proton) {
-    const compatData = path.resolve(env.DR_PROTON_COMPAT_DATA ?? path.join(home, ".local", "share", "dauntless-revived", "proton"));
+    const compatData = path.resolve(env.DR_INSTANCE_WINEPREFIX ?? env.DR_PROTON_COMPAT_DATA ?? path.join(home, ".local", "share", "dauntless-revived", "proton"));
     mkdirSync(compatData, { recursive: true });
     const steamRoot = steamRootFor(proton);
     command = proton;
@@ -107,7 +107,7 @@ export function buildWineLaunch(args, env = process.env) {
   } else {
     const wine = explicitWine ?? findOnPath(["wine64", "wine"], env);
     if (!wine) throw new Error("Proton or Wine was not found; set DR_PROTON_BINARY/DR_WINE_BINARY or install a runtime");
-    const prefix = path.resolve(env.DR_WINEPREFIX ?? path.join(home, ".local", "share", "dauntless-revived", "wineprefix"));
+    const prefix = path.resolve(env.DR_INSTANCE_WINEPREFIX ?? env.DR_WINEPREFIX ?? path.join(home, ".local", "share", "dauntless-revived", "wineprefix"));
     mkdirSync(prefix, { recursive: true });
     command = wine;
     gameArgs = [gameExe, ...args];
@@ -135,7 +135,21 @@ export function buildWineLaunch(args, env = process.env) {
   return { command, args: gameArgs, cwd, env: launchEnv, runtime };
 }
 
+function attachToGameCgroup(env) {
+  const cgroup = env.DR_GAMESERVER_CGROUP_PATH;
+  if (!cgroup) return;
+
+  const procs = path.join(cgroup, "cgroup.procs");
+  if (!existsSync(procs)) {
+    throw new Error("game cgroup does not exist: " + cgroup);
+  }
+
+  // Join before spawning Wine/Proton: all descendants inherit this cgroup.
+  writeFileSync(procs, String(process.pid));
+}
+
 export async function runWineGame(args, env = process.env) {
+  attachToGameCgroup(env);
   const spec = buildWineLaunch(args, env);
   return await new Promise((resolve) => {
     const child = spawn(spec.command, spec.args, { cwd: spec.cwd, env: spec.env, stdio: "inherit", windowsHide: false });

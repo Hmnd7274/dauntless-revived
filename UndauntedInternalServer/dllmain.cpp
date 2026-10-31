@@ -375,11 +375,19 @@ void GameEngineTickHook(UGameEngine* GameEngine, float DeltaTime, char CanRender
         }
 
         if (EnableWatchdog) {
-            if (!HasConnection) {
+            if (HasConnection) {
+                TotalNoPlayersTime = 0.0f;
+            }
+            else {
                 TotalNoPlayersTime += DeltaTime;
 
-                if (TotalNoPlayersTime >= 50.0f) {
-                    exit(0);
+                // Ramsgate: 3 hours. Hunts and Training Dojo: 50 seconds.
+                const float NoPlayerTimeoutSeconds =
+                    Globals::Port == 8777 ? 10800.0f : 50.0f;
+
+                // Exit code 42 marks an intentional idle shutdown.
+                if (TotalNoPlayersTime >= NoPlayerTimeoutSeconds) {
+                    exit(42);
                 }
             }
         }
@@ -966,7 +974,6 @@ void Init() {
             Globals::MyIpAndPort = Args[7];
 
             if (Globals::Port >= 8776) {
-                EnableWatchdog = false;
                 Globals::EnableLogging = true;
             }
         }

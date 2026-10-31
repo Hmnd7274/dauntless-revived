@@ -1,4 +1,6 @@
 import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process"
+import { existsSync, mkdirSync, readFileSync, rmSync, rmdirSync, writeFileSync } from "node:fs";
+import path from "node:path";
 import { setTimeout } from "node:timers/promises";
 
 import crypto from "node:crypto";
@@ -44,6 +46,144 @@ let TrainingDojoServer : Gameserver | undefined;
 type SpawnFunction = (Command: string, Args: string[], Options: SpawnOptions) => ChildProcess;
 let SpawnProcess: SpawnFunction = spawn;
 let ProcessIsAlive: (ProcessId: number) => boolean = (ProcessId) => IsProcessAlive(ProcessId);
+
+type InstanceResources = {
+    cgroupPath?: string,
+    winePrefixPath?: string
+};
+
+const InstanceResourcesById = new Map<string, InstanceResources>();
+const InstanceCleanupPromises = new Map<string, Promise<void>>();
+const CleaningServerIds = new Set<string>();
+const GameChildrenById = new Map<string, ChildProcess>();
+
+function PrepareInstanceResources(Id: string): NodeJS.ProcessEnv {
+    const LaunchEnv: NodeJS.ProcessEnv = { ...process.env };
+    const Resources: InstanceResources = {};
+
+    try {
+        const CgroupRoot = process.env.DR_GAMESERVER_CGROUP_ROOT;
+
+        if (CgroupRoot) {
+            if (!path.isAbsolute(CgroupRoot)) {
+                throw new Error("DR_GAMESERVER_CGROUP_ROOT must be an absolute path");
+            }
+
+            mkdirSync(CgroupRoot, { recursive: true });
+
+            const CgroupPath = path.join(CgroupRoot, Id);
+            mkdirSync(CgroupPath);
+            Resources.cgroupPath = CgroupPath;
+            LaunchEnv.DR_GAMESERVER_CGROUP_PATH = CgroupPath;
+        }
+
+        const PrefixRoot = process.env.DR_INSTANCE_WINEPREFIX_ROOT;
+
+        if (PrefixRoot) {
+            if (!path.isAbsolute(PrefixRoot)) {
+                throw new Error("DR_INSTANCE_WINEPREFIX_ROOT must be an absolute path");
+            }
+
+            mkdirSync(PrefixRoot, { recursive: true });
+
+            const PrefixPath = path.join(PrefixRoot, Id);
+            mkdirSync(PrefixPath);
+            Resources.winePrefixPath = PrefixPath;
+            LaunchEnv.DR_INSTANCE_WINEPREFIX = PrefixPath;
+        }
+
+        if (Resources.cgroupPath || Resources.winePrefixPath) {
+            InstanceResourcesById.set(Id, Resources);
+        }
+
+        return LaunchEnv;
+    }
+    catch (error) {
+        // No game process has been spawned yet, so these newly created directories are empty.
+        if (Resources.winePrefixPath) {
+            try { rmSync(Resources.winePrefixPath, { recursive: true, force: true }); } catch {}
+        }
+
+        if (Resources.cgroupPath) {
+            try { rmdirSync(Resources.cgroupPath); } catch {}
+        }
+
+        throw error;
+    }
+}
+
+async function CleanupInstanceResources(Id: string): Promise<void> {
+    const ExistingCleanup = InstanceCleanupPromises.get(Id);
+    if (ExistingCleanup !== undefined) {
+        return ExistingCleanup;
+    }
+
+    const Resources = InstanceResourcesById.get(Id);
+    if (Resources === undefined) {
+        return;
+    }
+
+    const Cleanup = (async () => {
+        if (Resources.cgroupPath && existsSync(Resources.cgroupPath)) {
+            const KillPath = path.join(Resources.cgroupPath, "cgroup.kill");
+            const EventsPath = path.join(Resources.cgroupPath, "cgroup.events");
+
+            if (!existsSync(KillPath) || !existsSync(EventsPath)) {
+                throw new Error(`Incomplete cgroup at ${Resources.cgroupPath}; refusing to delete its Wine prefix`);
+            }
+
+            // Kill every process in this instance, including orphaned Wine descendants.
+            writeFileSync(KillPath, "1");
+
+            const Deadline = Date.now() + 10000;
+
+            while (true) {
+                const Events = readFileSync(EventsPath, "utf8");
+
+                if (/^populated\\s+0\\s*$/m.test(Events)) {
+                    break;
+                }
+
+                if (Date.now() >= Deadline) {
+                    throw new Error(`Timed out waiting for cgroup ${Resources.cgroupPath} to become empty`);
+                }
+
+                await setTimeout(50);
+            }
+
+            try {
+                rmdirSync(Resources.cgroupPath);
+            }
+            catch (error) {
+                if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+                    throw error;
+                }
+            }
+        }
+
+        // Delete the prefix only after the cgroup is confirmed empty.
+        if (Resources.winePrefixPath) {
+            rmSync(Resources.winePrefixPath, { recursive: true, force: true });
+        }
+
+        InstanceResourcesById.delete(Id);
+    })();
+
+    InstanceCleanupPromises.set(Id, Cleanup);
+
+    try {
+        await Cleanup;
+    }
+    finally {
+        InstanceCleanupPromises.delete(Id);
+    }
+}
+
+function LogInstanceCleanupFailure(Id: string, error: unknown) {
+    const Message = error instanceof Error ? error.message : String(error);
+    logger.error(`Could not clean up game server instance ${Id}: ${Message}`);
+}
+
 
 const PORT_RANGE_BEGIN = Number(process.env.PORT_RANGE_BEGIN!);
 const PORT_RANGE_END = Number(process.env.PORT_RANGE_END!);
@@ -120,18 +260,56 @@ function TransformExpectedPlayerArgs(ExpectedPlayers: ExpectedPlayer[]){
 // Called by the watchdog for a server whose process has exited. Ramsgate and the Dojo are started
 // again (through the same shared launch as a player's request, so the two never start two processes
 // on one port); a hunt's port goes back to the pool.
-export async function CleanupServer(ServerToShutdown: Gameserver){
-    if (!Gameservers.includes(ServerToShutdown)) return; // exit event and watchdog may race
-    Gameservers = Gameservers.filter(Server => Server !== ServerToShutdown);
+export async function CleanupServer(ServerToShutdown: Gameserver, RestartPersistentWorld = true){
+    if (!Gameservers.includes(ServerToShutdown)) return;
 
-    if(ServerToShutdown.isRamsgate){
-        await EnsurePersistentWorld("ramsgate", "RAMSGATE HAS FALLEN! Restarting!");
+    // ChildProcess.exitCode is also checked here because the watchdog can race
+    // with the child's "exit" event.
+    const ShouldRestartPersistentWorld =
+        RestartPersistentWorld && GameChildrenById.get(ServerToShutdown.id)?.exitCode !== 42;
+
+    // The process exit handler and watchdog can observe the same exit concurrently.
+    // Only one cleanup may release this server's port or restart its persistent world.
+    if (CleaningServerIds.has(ServerToShutdown.id)) return;
+    CleaningServerIds.add(ServerToShutdown.id);
+
+    try {
+        // Keep the server registered and its port reserved until its cgroup is empty.
+        if (InstanceResourcesById.has(ServerToShutdown.id)) {
+            await CleanupInstanceResources(ServerToShutdown.id);
+        }
+
+        if (!Gameservers.includes(ServerToShutdown)) return;
+
+        Gameservers = Gameservers.filter(Server => Server !== ServerToShutdown);
+        GameChildrenById.delete(ServerToShutdown.id);
+
+        if(ServerToShutdown.isRamsgate){
+            if (RamsgateServer === ServerToShutdown) RamsgateServer = undefined;
+
+            if (ShouldRestartPersistentWorld) {
+                await EnsurePersistentWorld("ramsgate", "RAMSGATE HAS FALLEN! Restarting!");
+            }
+            else {
+                logger.info("Ramsgate stopped after its idle timeout; it will start again on demand.");
+            }
+        }
+        else if(ServerToShutdown.isTrainingDojo){
+            if (TrainingDojoServer === ServerToShutdown) TrainingDojoServer = undefined;
+
+            if (ShouldRestartPersistentWorld) {
+                await EnsurePersistentWorld("dojo", "Training Dojo Crashed! Restarting!");
+            }
+            else {
+                logger.info("Training Dojo stopped after its idle timeout; it will start again on demand.");
+            }
+        }
+        else{
+            FreePorts.push(ServerToShutdown.port);
+        }
     }
-    else if(ServerToShutdown.isTrainingDojo){
-        await EnsurePersistentWorld("dojo", "Training Dojo Crashed! Restarting!");
-    }
-    else{
-        FreePorts.push(ServerToShutdown.port);
+    finally {
+        CleaningServerIds.delete(ServerToShutdown.id);
     }
 }
 
@@ -245,6 +423,22 @@ async function StartServerNow(Map: string, Behemoth: string | undefined, Matchma
     }
 
     const IsHunt = !IsRamsgate && !IsTrainingDojo;
+
+    let InstanceEnv: NodeJS.ProcessEnv;
+
+    try {
+        InstanceEnv = PrepareInstanceResources(Id);
+    }
+    catch(error) {
+        ReleaseReservation();
+
+        if(IsHunt && !FreePorts.includes(Port)) {
+            FreePorts.push(Port);
+        }
+
+        throw error;
+    }
+
     let Child: ChildProcess;
 
     try{
@@ -260,12 +454,15 @@ async function StartServerNow(Map: string, Behemoth: string | undefined, Matchma
         ], {
             // Keep the long-running Ramsgate and Dojo diagnostic windows visible,
             // but do not flash a new command window for every temporary hunt.
+            env: InstanceEnv,
             windowsHide: IsHunt
         });
     }
     catch(error){
         ReleaseReservation();
-        if(IsHunt){
+        await CleanupInstanceResources(Id).catch(CleanupError => LogInstanceCleanupFailure(Id, CleanupError));
+
+        if(IsHunt && !FreePorts.includes(Port)){
             FreePorts.push(Port);
         }
 
@@ -273,16 +470,32 @@ async function StartServerNow(Map: string, Behemoth: string | undefined, Matchma
         throw new Error(`Could not start a game server on port ${Port}`);
     }
 
+    GameChildrenById.set(Id, Child);
+
     // A process that cannot be started (a wrong GAMESERVER_BINARY_PATH, a missing file) reports it
     // as an "error" event. Without a listener that event took the whole deploy server down.
-    Child.on("error", (error) => { ReleaseReservation(); logger.error(`Game server on port ${Port} failed: ${error.message} (GAMESERVER_BINARY_PATH is ${GAMESERVER_BINARY_PATH})`); });
+    Child.on("error", (error) => {
+        GameChildrenById.delete(Id);
+        ReleaseReservation();
+        void CleanupInstanceResources(Id).catch(CleanupError => LogInstanceCleanupFailure(Id, CleanupError));
+        logger.error(`Game server on port ${Port} failed: ${error.message} (GAMESERVER_BINARY_PATH is ${GAMESERVER_BINARY_PATH})`);
+    });
     Child.on("exit", (Code, Signal) => {
         ReleaseReservation();
-        // Release hunt ports immediately instead of waiting up to 60s for the watchdog.
-        if (IsHunt) {
-            const Finished = Gameservers.find(Server => Server.id === Id);
-            if (Finished) void CleanupServer(Finished);
+
+        const Finished = Gameservers.find(Server => Server.id === Id);
+
+        if (Finished) {
+            // Code 42 means the DLL intentionally stopped after its idle timeout.
+            void CleanupServer(Finished, Code !== 42)
+                .catch(CleanupError => LogInstanceCleanupFailure(Id, CleanupError));
         }
+        else {
+            GameChildrenById.delete(Id);
+            void CleanupInstanceResources(Id)
+                .catch(CleanupError => LogInstanceCleanupFailure(Id, CleanupError));
+        }
+
         const Line = `Game server on port ${Port} (pid ${Child.pid}) exited ${Signal != null ? `on ${Signal}` : `with code ${Code}`}`;
 
         if(Code === 0){
@@ -299,8 +512,11 @@ async function StartServerNow(Map: string, Behemoth: string | undefined, Matchma
     // hunt's port goes back to the pool and the caller (the matchmaking call) gets an error, which the
     // metagame reports to the player as FAILED instead of an address nothing listens on.
     if(Child.pid === undefined){
+        GameChildrenById.delete(Id);
         ReleaseReservation();
-        if(IsHunt){
+        await CleanupInstanceResources(Id).catch(CleanupError => LogInstanceCleanupFailure(Id, CleanupError));
+
+        if(IsHunt && !FreePorts.includes(Port)){
             FreePorts.push(Port);
         }
 
@@ -311,6 +527,8 @@ async function StartServerNow(Map: string, Behemoth: string | undefined, Matchma
         await WaitForServerStartup(Child, Port, IsHunt);
     }
     catch(error){
+        await CleanupInstanceResources(Id).catch(CleanupError => LogInstanceCleanupFailure(Id, CleanupError));
+
         if(IsHunt && !FreePorts.includes(Port)){
             FreePorts.push(Port);
         }
@@ -592,6 +810,10 @@ export function ResetGameserversForTests(){
     RamsgateServer = undefined;
     TrainingDojoServer = undefined;
     PersistentWorldLaunches.clear();
+    InstanceResourcesById.clear();
+    InstanceCleanupPromises.clear();
+    CleaningServerIds.clear();
+    GameChildrenById.clear();
 }
 
 export function GameserverStateForTests(){

@@ -1,9 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { buildWineLaunch, decodeWorkerPayload } from "../../unix-common/game-runner.mjs";
+import { buildWineLaunch, decodeWorkerPayload, runWineGame } from "../../unix-common/game-runner.mjs";
 import { buildSshLaunch } from "../../openbsd-server/launch-gameserver.mjs";
 
 function exe(file) {
@@ -73,6 +73,89 @@ test("Linux runner uses Xvfb when a server has no display", () => {
     assert.equal(spec.command, xvfb);
     assert.ok(spec.args.includes(wine));
     assert.ok(spec.args.includes(game));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("per-instance prefixes override shared Wine and Proton prefixes", () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "dr-instance-prefix-"));
+  try {
+    const game = exe(path.join(root, "game", "Dauntless-Win64-Shipping.exe"));
+    const wine = exe(path.join(root, "bin", "wine64"));
+
+    const commonWineEnv = {
+      PATH: path.dirname(wine),
+      DISPLAY: ":99",
+      DR_GAME_EXE: game,
+      DR_WINE_BINARY: wine,
+      DR_WINEPREFIX: path.join(root, "shared-wine-prefix"),
+    };
+
+    const wineA = path.join(root, "instances", "wine-a");
+    const wineB = path.join(root, "instances", "wine-b");
+
+    const wineSpecA = buildWineLaunch([], { ...commonWineEnv, DR_INSTANCE_WINEPREFIX: wineA });
+    const wineSpecB = buildWineLaunch([], { ...commonWineEnv, DR_INSTANCE_WINEPREFIX: wineB });
+
+    assert.equal(wineSpecA.env.WINEPREFIX, wineA);
+    assert.equal(wineSpecB.env.WINEPREFIX, wineB);
+    assert.notEqual(wineSpecA.env.WINEPREFIX, wineSpecB.env.WINEPREFIX);
+
+    const proton = exe(path.join(root, "Steam", "compatibilitytools.d", "GE-Proton10-1", "proton"));
+
+    const commonProtonEnv = {
+      PATH: "",
+      DISPLAY: ":99",
+      HOME: root,
+      DR_GAME_EXE: game,
+      DR_PROTON_BINARY: proton,
+      DR_PROTON_COMPAT_DATA: path.join(root, "shared-proton-compat"),
+    };
+
+    const protonA = path.join(root, "instances", "proton-a");
+    const protonB = path.join(root, "instances", "proton-b");
+
+    const protonSpecA = buildWineLaunch([], { ...commonProtonEnv, DR_INSTANCE_WINEPREFIX: protonA });
+    const protonSpecB = buildWineLaunch([], { ...commonProtonEnv, DR_INSTANCE_WINEPREFIX: protonB });
+
+    assert.equal(protonSpecA.env.STEAM_COMPAT_DATA_PATH, protonA);
+    assert.equal(protonSpecB.env.STEAM_COMPAT_DATA_PATH, protonB);
+    assert.notEqual(protonSpecA.env.STEAM_COMPAT_DATA_PATH, protonSpecB.env.STEAM_COMPAT_DATA_PATH);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("game runner joins its instance cgroup before starting Wine", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "dr-instance-cgroup-"));
+  try {
+    const game = exe(path.join(root, "game", "Dauntless-Win64-Shipping.exe"));
+    const wine = exe(path.join(root, "bin", "wine64"));
+    const cgroup = path.join(root, "cgroup");
+    const marker = path.join(root, "wine-observed-pid.txt");
+
+    mkdirSync(cgroup);
+    writeFileSync(path.join(cgroup, "cgroup.procs"), "");
+
+    writeFileSync(
+      wine,
+      '#!/bin/sh\ncat "$DR_GAMESERVER_CGROUP_PATH/cgroup.procs" > "$DR_CGROUP_MARKER"\nexit 0\n',
+    );
+    chmodSync(wine, 0o755);
+
+    const code = await runWineGame([], {
+      PATH: `${path.dirname(wine)}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+      DISPLAY: ":99",
+      DR_GAME_EXE: game,
+      DR_WINE_BINARY: wine,
+      DR_GAMESERVER_CGROUP_PATH: cgroup,
+      DR_CGROUP_MARKER: marker,
+      DR_INSTANCE_WINEPREFIX: path.join(root, "prefix"),
+    });
+
+    assert.equal(code, 0);
+    assert.equal(readFileSync(marker, "utf8").trim(), String(process.pid));
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
