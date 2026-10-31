@@ -73,7 +73,7 @@ function GameserverStartupGraceMs(){
 function TrainingDojoStartupGraceMs(){
     const Raw = process.env.TRAINING_DOJO_STARTUP_GRACE_MS;
     if(Raw === undefined){
-        return 30000;
+        return 20000;
     }
 
     const Value = Number(Raw);

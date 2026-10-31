@@ -325,7 +325,7 @@ void EncounterableSetupHook() {
 
 float TotalNoPlayersTime = 0.0f;
 
-bool EnableWatchdog = false;
+bool EnableWatchdog = true;
 
 // Read-only counters for diagnostics; the net driver's internal tag is not a frame counter.
 extern "C" {
@@ -375,7 +375,10 @@ void GameEngineTickHook(UGameEngine* GameEngine, float DeltaTime, char CanRender
         }
 
         if (EnableWatchdog) {
-            if (!HasConnection) {
+            if (HasConnection) {
+                TotalNoPlayersTime = 0.0f;
+            }
+            else {
                 TotalNoPlayersTime += DeltaTime;
 
                 if (TotalNoPlayersTime >= 50.0f) {
