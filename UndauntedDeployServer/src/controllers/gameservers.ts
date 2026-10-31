@@ -70,12 +70,29 @@ function GameserverStartupGraceMs(){
     return Value;
 }
 
-async function WaitForServerStartup(Child: ChildProcess, Port: number, IsHunt: boolean){
-    if(!IsHunt){
+function TrainingDojoStartupGraceMs(){
+    const Raw = process.env.TRAINING_DOJO_STARTUP_GRACE_MS;
+    if(Raw === undefined){
+        return 30000;
+    }
+
+    const Value = Number(Raw);
+
+    if(!/^\d+$/.test(Raw) || !Number.isSafeInteger(Value) || Value < 0 || Value > 120000){
+        throw new Error("Invalid TRAINING_DOJO_STARTUP_GRACE_MS");
+    }
+
+    return Value;
+}
+
+async function WaitForServerStartup(Child: ChildProcess, Port: number, IsHunt: boolean, IsTrainingDojo: boolean){
+    if(!IsHunt && !IsTrainingDojo){
         return;
     }
 
-    const GraceMs = GameserverStartupGraceMs();
+    const GraceMs = IsTrainingDojo
+        ? TrainingDojoStartupGraceMs()
+        : GameserverStartupGraceMs();
 
     if(GraceMs === 0){
         return;
@@ -309,7 +326,7 @@ async function StartServerNow(Map: string, Behemoth: string | undefined, Matchma
     }
 
     try{
-        await WaitForServerStartup(Child, Port, IsHunt);
+        await WaitForServerStartup(Child, Port, IsHunt, IsTrainingDojo);
     }
     catch(error){
         if(IsHunt && !FreePorts.includes(Port)){
