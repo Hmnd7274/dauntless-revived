@@ -767,6 +767,60 @@ export async function HandlePlayerMatchmaking(GameMode: string, GameArgs: string
             // Ramsgate, the Dojo or the tutorial instead of a hunt the player was still queued for
             LeaveWaitingQueues(PlayerId, "their new join replaces it");
 
+            // CITY (Ramsgate) and SHARED (Training Dojo) may need time to boot.
+            // Keep the client in MATCHING while the DeployServer starts the world
+            // and waits for its UDP listener. Do not block the initial join request.
+            if (GameMode === "CITY" || GameMode === "SHARED") {
+                const Entry: MatchmakingResult = {
+                    Ready: false,
+                    CandidateId: crypto.randomUUID(),
+                    HuntId: HuntId,
+                    Host: "",
+                    Port: 0
+                };
+
+                MatchmakingResultMap.set(PlayerId, Entry);
+
+                const TryLaunch = async (): Promise<boolean> => {
+                    if (MatchmakingResultMap.get(PlayerId) !== Entry) return true;
+
+                    const result = await LaunchGameOnDeployserver(
+                        GameMode, GameArgs, HuntId, undefined
+                    );
+
+                    if (result.capacity) return false;
+
+                    if (MatchmakingResultMap.get(PlayerId) === Entry) {
+                        Object.assign(Entry, {
+                            Ready: result.succeeded,
+                            Host: result.host,
+                            Port: result.port,
+                            Failed: !result.succeeded
+                        });
+                    }
+
+                    return true;
+                };
+
+                void TryLaunch()
+                    .then((done) => {
+                        if (!done && !ParkCapacity(Entry.CandidateId, TryLaunch)) {
+                            Entry.Failed = true;
+                        }
+                    })
+                    .catch((error) => {
+                        if (MatchmakingResultMap.get(PlayerId) === Entry) {
+                            Entry.Failed = true;
+                        }
+
+                        logger.error(
+                            `mm: ${GameMode} ${HuntId} launch for ${PlayerId} failed: ${(error as Error)?.message}`
+                        );
+                    });
+
+                return true;
+            }
+
             const GameOnDeployServer = await LaunchGameOnDeployserver(GameMode, GameArgs, HuntId, undefined);
 
             const Entry: MatchmakingResult = {

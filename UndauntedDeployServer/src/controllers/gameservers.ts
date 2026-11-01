@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process"
+import { readFile } from "node:fs/promises";
 import { setTimeout } from "node:timers/promises";
 
 import crypto from "node:crypto";
@@ -39,6 +40,11 @@ let FreePorts: number[] = [];
 let RamsgateServer : Gameserver | undefined;
 let TrainingDojoServer : Gameserver | undefined;
 
+// Keep child references and exit codes so the watchdog can distinguish
+// a deliberate idle shutdown (42) from an unexpected crash.
+const GameChildrenById = new Map<string, ChildProcess>();
+const GameExitCodes = new Map<string, number | null>();
+
 // How game processes are started and checked. Tests swap in stand-ins (UseProcessFunctionsForTests);
 // nothing else changes them.
 type SpawnFunction = (Command: string, Args: string[], Options: SpawnOptions) => ChildProcess;
@@ -73,42 +79,128 @@ function GameserverStartupGraceMs(){
 function TrainingDojoStartupGraceMs(){
     const Raw = process.env.TRAINING_DOJO_STARTUP_GRACE_MS;
     if(Raw === undefined){
-        return 20000;
+        return 180000;
     }
 
     const Value = Number(Raw);
 
-    if(!/^\d+$/.test(Raw) || !Number.isSafeInteger(Value) || Value < 0 || Value > 120000){
+    if(!/^\d+$/.test(Raw) || !Number.isSafeInteger(Value) || Value < 0 || Value > 300000){
         throw new Error("Invalid TRAINING_DOJO_STARTUP_GRACE_MS");
     }
 
     return Value;
 }
 
-async function WaitForServerStartup(Child: ChildProcess, Port: number, IsHunt: boolean, IsTrainingDojo: boolean){
-    if(!IsHunt && !IsTrainingDojo){
+function RamsgateStartupGraceMs(){
+    const Raw = process.env.RAMSGATE_STARTUP_GRACE_MS;
+    if(Raw === undefined){
+        return 180000;
+    }
+
+    const Value = Number(Raw);
+
+    if(!/^\d+$/.test(Raw) || !Number.isSafeInteger(Value) || Value < 0 || Value > 300000){
+        throw new Error("Invalid RAMSGATE_STARTUP_GRACE_MS");
+    }
+
+    return Value;
+}
+
+// Read Linux's UDP socket tables without trying to bind the port ourselves.
+// This avoids briefly stealing the port from Unreal while probing readiness.
+async function IsUdpPortListening(Port: number): Promise<boolean>{
+    const ExpectedPortHex = Port.toString(16).toUpperCase().padStart(4, "0");
+
+    for(const ProcFile of ["/proc/net/udp", "/proc/net/udp6"]){
+        try{
+            const Content = await readFile(ProcFile, "utf8");
+            const Lines = Content.split(/\r?\n/).slice(1);
+
+            if(Lines.some((Line) => {
+                const Fields = Line.trim().split(/\s+/);
+                const LocalAddress = Fields[1];
+                const LocalPortHex = LocalAddress?.split(":")[1]?.toUpperCase();
+                return LocalPortHex === ExpectedPortHex;
+            })){
+                return true;
+            }
+        }
+        catch{
+            // Continue with the other proc table.
+        }
+    }
+
+    return false;
+}
+
+async function WaitForServerStartup(
+    Child: ChildProcess,
+    Port: number,
+    IsHunt: boolean,
+    IsTrainingDojo: boolean,
+    IsRamsgate: boolean
+){
+    const NeedsUdpListener = IsRamsgate || IsTrainingDojo;
+
+    if(!IsHunt && !NeedsUdpListener){
         return;
     }
 
-    const GraceMs = IsTrainingDojo
-        ? TrainingDojoStartupGraceMs()
-        : GameserverStartupGraceMs();
-
-    if(GraceMs === 0){
-        return;
-    }
+    const GraceMs = IsRamsgate
+        ? RamsgateStartupGraceMs()
+        : IsTrainingDojo
+            ? TrainingDojoStartupGraceMs()
+            : GameserverStartupGraceMs();
 
     let OnExit!: (Code: number | null, Signal: NodeJS.Signals | null) => void;
     let OnError!: (error: Error) => void;
+
     const Failed = new Promise<never>((_Resolve, Reject) => {
-        OnExit = (Code, Signal) => Reject(new Error(`Game server on port ${Port} exited during startup (${Signal ?? Code ?? "unknown"})`));
-        OnError = (error) => Reject(new Error(`Game server on port ${Port} failed during startup: ${error.message}`));
+        OnExit = (Code, Signal) => Reject(
+            new Error(`Game server on port ${Port} exited during startup (${Signal ?? Code ?? "unknown"})`)
+        );
+        OnError = (error) => Reject(
+            new Error(`Game server on port ${Port} failed during startup: ${error.message}`)
+        );
+
         Child.once("exit", OnExit);
         Child.once("error", OnError);
     });
 
     try{
-        await Promise.race([setTimeout(GraceMs), Failed]);
+        if(NeedsUdpListener){
+            const Deadline = Date.now() + GraceMs;
+
+            while(true){
+                if(Child.pid === undefined || !ProcessIsAlive(Child.pid)){
+                    throw new Error(`Game server on port ${Port} exited before becoming ready`);
+                }
+
+                if(await IsUdpPortListening(Port)){
+                    if(Child.pid === undefined || !ProcessIsAlive(Child.pid)){
+                        throw new Error(`Game server on port ${Port} exited during readiness check`);
+                    }
+
+                    logger.info(`Game server on port ${Port} is listening on UDP; ready for players`);
+                    return;
+                }
+
+                const Remaining = Deadline - Date.now();
+                if(Remaining <= 0){
+                    break;
+                }
+
+                await Promise.race([setTimeout(Math.min(500, Remaining)), Failed]);
+            }
+
+            throw new Error(
+                `Game server on port ${Port} did not open its UDP port within ${GraceMs}ms`
+            );
+        }
+
+        if(GraceMs > 0){
+            await Promise.race([setTimeout(GraceMs), Failed]);
+        }
     }
     finally{
         Child.off("exit", OnExit);
@@ -138,16 +230,45 @@ function TransformExpectedPlayerArgs(ExpectedPlayers: ExpectedPlayer[]){
 // again (through the same shared launch as a player's request, so the two never start two processes
 // on one port); a hunt's port goes back to the pool.
 export async function CleanupServer(ServerToShutdown: Gameserver){
-    if (!Gameservers.includes(ServerToShutdown)) return; // exit event and watchdog may race
+    if(!Gameservers.includes(ServerToShutdown)) return;
+
+    const Child = GameChildrenById.get(ServerToShutdown.id);
+    const ExitCode = GameExitCodes.has(ServerToShutdown.id)
+        ? GameExitCodes.get(ServerToShutdown.id)
+        : Child?.exitCode;
+
+    const IntentionalIdleStop = ExitCode === 42;
+
+    GameExitCodes.delete(ServerToShutdown.id);
+    GameChildrenById.delete(ServerToShutdown.id);
+
     Gameservers = Gameservers.filter(Server => Server !== ServerToShutdown);
 
     if(ServerToShutdown.isRamsgate){
-        await EnsurePersistentWorld("ramsgate", "RAMSGATE HAS FALLEN! Restarting!");
+        if(RamsgateServer === ServerToShutdown){
+            RamsgateServer = undefined;
+        }
+
+        if(IntentionalIdleStop){
+            logger.info("Ramsgate stopped after 3 hours idle; it will start on the next player request.");
+        }
+        else{
+            await EnsurePersistentWorld("ramsgate", "RAMSGATE HAS FALLEN! Restarting!");
+        }
     }
     else if(ServerToShutdown.isTrainingDojo){
-        await EnsurePersistentWorld("dojo", "Training Dojo Crashed! Restarting!");
+        if(TrainingDojoServer === ServerToShutdown){
+            TrainingDojoServer = undefined;
+        }
+
+        if(IntentionalIdleStop){
+            logger.info("Training Dojo stopped after 50 seconds idle; it will start on the next player request.");
+        }
+        else{
+            await EnsurePersistentWorld("dojo", "Training Dojo Crashed! Restarting!");
+        }
     }
-    else{
+    else if(!FreePorts.includes(ServerToShutdown.port)){
         FreePorts.push(ServerToShutdown.port);
     }
 }
@@ -291,19 +412,30 @@ async function StartServerNow(Map: string, Behemoth: string | undefined, Matchma
         throw new Error(`Could not start a game server on port ${Port}`);
     }
 
-    // A process that cannot be started (a wrong GAMESERVER_BINARY_PATH, a missing file) reports it
-    // as an "error" event. Without a listener that event took the whole deploy server down.
-    Child.on("error", (error) => { ReleaseReservation(); logger.error(`Game server on port ${Port} failed: ${error.message} (GAMESERVER_BINARY_PATH is ${GAMESERVER_BINARY_PATH})`); });
+    GameChildrenById.set(Id, Child);
+
+    // A process that cannot be started (a wrong GAMESERVER_BINARY_PATH, a missing file)
+    // reports it as an "error" event. Do not let that event take down the DeployServer.
+    Child.on("error", (error) => {
+        GameChildrenById.delete(Id);
+        GameExitCodes.delete(Id);
+        ReleaseReservation();
+        logger.error(`Game server on port ${Port} failed: ${error.message} (GAMESERVER_BINARY_PATH is ${GAMESERVER_BINARY_PATH})`);
+    });
+
     Child.on("exit", (Code, Signal) => {
         ReleaseReservation();
-        // Release hunt ports immediately instead of waiting up to 60s for the watchdog.
-        if (IsHunt) {
-            const Finished = Gameservers.find(Server => Server.id === Id);
-            if (Finished) void CleanupServer(Finished);
-        }
-        const Line = `Game server on port ${Port} (pid ${Child.pid}) exited ${Signal != null ? `on ${Signal}` : `with code ${Code}`}`;
+        GameExitCodes.set(Id, Code);
 
-        if(Code === 0){
+        const Finished = Gameservers.find(Server => Server.id === Id);
+        if(Finished){
+            void CleanupServer(Finished).catch(error => logger.error(
+                `Could not clean up game server on port ${Port}: ${error instanceof Error ? error.message : String(error)}`
+            ));
+        }
+
+        const Line = `Game server on port ${Port} (pid ${Child.pid}) exited ${Signal != null ? `on ${Signal}` : `with code ${Code}`}`;
+        if(Code === 0 || Code === 42){
             logger.info(Line);
         }
         else{
@@ -317,6 +449,8 @@ async function StartServerNow(Map: string, Behemoth: string | undefined, Matchma
     // hunt's port goes back to the pool and the caller (the matchmaking call) gets an error, which the
     // metagame reports to the player as FAILED instead of an address nothing listens on.
     if(Child.pid === undefined){
+        GameChildrenById.delete(Id);
+        GameExitCodes.delete(Id);
         ReleaseReservation();
         if(IsHunt){
             FreePorts.push(Port);
@@ -326,9 +460,22 @@ async function StartServerNow(Map: string, Behemoth: string | undefined, Matchma
     }
 
     try{
-        await WaitForServerStartup(Child, Port, IsHunt, IsTrainingDojo);
+        await WaitForServerStartup(Child, Port, IsHunt, IsTrainingDojo, IsRamsgate);
     }
     catch(error){
+        if(Child.exitCode === null && Child.signalCode === null){
+            const Exited = new Promise<void>((Resolve) => Child.once("exit", () => Resolve()));
+            try{
+                Child.kill("SIGTERM");
+            }
+            catch{}
+
+            await Promise.race([Exited, setTimeout(5000)]);
+        }
+
+        GameExitCodes.delete(Id);
+        GameChildrenById.delete(Id);
+
         if(IsHunt && !FreePorts.includes(Port)){
             FreePorts.push(Port);
         }
@@ -570,7 +717,7 @@ export async function Startup(){
 
     if (process.env.HUNT_WORKER === '1') return;
 
-    await EnsurePersistentWorld("ramsgate");
+    // Ramsgate is started on demand by GetRamsgateConnectionDetails().
 
     // Upstream always started the Dojo here. Opt back in with ENABLE_DOJO=1 on
     // a machine with RAM to spare; otherwise it starts on first use.
@@ -610,6 +757,8 @@ export function ResetGameserversForTests(){
     RamsgateServer = undefined;
     TrainingDojoServer = undefined;
     PersistentWorldLaunches.clear();
+    GameChildrenById.clear();
+    GameExitCodes.clear();
 }
 
 export function GameserverStateForTests(){

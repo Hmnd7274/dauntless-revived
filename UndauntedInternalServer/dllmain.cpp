@@ -394,15 +394,21 @@ void GameEngineTickHook(UGameEngine* GameEngine, float DeltaTime, char CanRender
             else {
                 TotalNoPlayersTime += DeltaTime;
 
-                if (TotalNoPlayersTime >= 50.0f) {
-                    std::cout << "[IDLE-WATCHDOG] port=" << Globals::Port
-                              << " timeout reached, terminating process" << std::endl;
+                const float NoPlayerTimeoutSeconds =
+                    Globals::Port == 8777 ? 10800.0f : 50.0f;
 
-                    if (!TerminateProcess(GetCurrentProcess(), 0)) {
+                if (TotalNoPlayersTime >= NoPlayerTimeoutSeconds) {
+                    std::cout << "[IDLE-WATCHDOG] port=" << Globals::Port
+                              << " timeout reached after " << NoPlayerTimeoutSeconds
+                              << " seconds, terminating process (idle exit code 42)"
+                              << std::endl;
+
+                    if (!TerminateProcess(GetCurrentProcess(), 42)) {
                         const DWORD TerminateError = GetLastError();
                         std::cerr << "[IDLE-WATCHDOG] TerminateProcess failed, error="
-                                  << TerminateError << "; falling back to ExitProcess" << std::endl;
-                        ExitProcess(0);
+                                  << TerminateError << "; falling back to ExitProcess"
+                                  << std::endl;
+                        ExitProcess(42);
                     }
                 }
             }
@@ -1010,9 +1016,11 @@ void Init() {
             Globals::EnableLogging = true; // TEMP: diagnostics for hunt servers
 
             if (Globals::Port >= 8776) {
-                EnableWatchdog = false;
                 Globals::EnableLogging = true;
             }
+
+            // All game servers use the idle watchdog.
+            EnableWatchdog = true;
         }
         else {
             MessageBoxA(nullptr, "INVALID GAMESERVER ARGS", "INVALID GAMESERVER ARGS", 0);
